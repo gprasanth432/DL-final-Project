@@ -1,3 +1,4 @@
+
 from google.colab import drive
 import zipfile, os
 import torch
@@ -101,3 +102,59 @@ class TinyCNN(nn.Module):
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model  = TinyCNN().to(device)
 print(model)
+
+import torch.optim as optim
+
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=1e-3)
+
+def train_one_epoch(dl):
+    model.train()
+    loss_sum, correct, total = 0,0,0
+    for xb, yb in dl:
+        xb, yb = xb.to(device), yb.to(device)
+        optimizer.zero_grad()
+        out = model(xb)
+        loss = criterion(out, yb)
+        loss.backward(); optimizer.step()
+        loss_sum += loss.item()*xb.size(0)
+        preds = out.argmax(1)
+        correct  += (preds==yb).sum().item()
+        total    += xb.size(0)
+    return loss_sum/total, correct/total
+
+def eval_one_epoch(dl):
+    model.eval()
+    loss_sum, correct, total = 0,0,0
+    with torch.no_grad():
+        for xb, yb in dl:
+            xb, yb = xb.to(device), yb.to(device)
+            out = model(xb)
+            loss = criterion(out, yb)
+            loss_sum += loss.item()*xb.size(0)
+            preds = out.argmax(1)
+            correct  += (preds==yb).sum().item()
+            total    += xb.size(0)
+    return loss_sum/total, correct/total
+
+
+num_epochs = 15
+for e in range(1, num_epochs+1):
+    tl, ta = train_one_epoch(train_loader)
+    vl, va = eval_one_epoch(val_loader)
+    print(f"Epoch {e} | Train Acc {ta:.4f}, Loss {tl:.4f} | Val Acc {va:.4f}, Loss {vl:.4f}")
+
+torch.save(model.state_dict(), 'baseline_simplecnn.pt')
+print("Saved baseline_simplecnn_weapons.pt")
+
+import os
+
+test_img_dir  = os.path.join(root_dir, 'test',  'images')
+test_ann_dir  = os.path.join(root_dir, 'test',  'labels')
+
+test_samples = parse_yolo(test_ann_dir, test_img_dir)
+
+test_ds     = WeaponCropDataset(test_samples, tfms)
+test_loader = DataLoader(test_ds, batch_size=32, shuffle=False, num_workers=2)
+
+print(f"Test samples: {len(test_ds)} → Test batches: {len(test_loader)}")

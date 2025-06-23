@@ -62,3 +62,6 @@ TinyCNN(
   )
 )
 ```
+
+Update :
+Model creation and training is done, model class created, model training function created, model trained
