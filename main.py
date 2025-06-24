@@ -158,3 +158,83 @@ test_ds     = WeaponCropDataset(test_samples, tfms)
 test_loader = DataLoader(test_ds, batch_size=32, shuffle=False, num_workers=2)
 
 print(f"Test samples: {len(test_ds)} → Test batches: {len(test_loader)}")
+
+import torch
+from sklearn.metrics import classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+test_loss, test_acc = eval_one_epoch(test_loader)
+print(f"Test Loss: {test_loss:.4f} | Test Acc: {test_acc:.4f}")
+
+model.eval()
+all_preds, all_labels = [], []
+with torch.no_grad():
+    for xb, yb in test_loader:
+        xb = xb.to(device)
+        logits = model(xb)
+        preds = logits.argmax(dim=1).cpu().tolist()
+        all_preds.extend(preds)
+        all_labels.extend(yb.tolist())
+
+print("\nClassification Report:")
+print(classification_report(all_labels, all_preds, target_names=['gun','knife']))
+
+print("Confusion Matrix:")
+cm = confusion_matrix(all_labels, all_preds)
+print(cm)
+
+plt.figure(figsize=(6,5))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=['gun','knife'], yticklabels=['gun','knife'])
+plt.xlabel('Predicted')
+plt.ylabel('True')
+plt.title('Confusion Matrix')
+plt.show()
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+from collections import Counter
+
+all_samples = train_samples + val_samples + test_samples
+classes = [sample[-1] for sample in all_samples]
+
+class_counts = Counter(classes)
+class_names = {0: 'gun', 1: 'knife'}
+
+print("Class Distribution:")
+for cls, count in class_counts.items():
+    print(f"{class_names[cls]}: {count}")
+
+plt.figure(figsize=(6, 4))
+sns.barplot(x=list(class_names.values()), y=list(class_counts.values()))
+plt.title('Distribution of Classes')
+plt.xlabel('Class')
+plt.ylabel('Number of Samples')
+plt.show()
+
+import cv2
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+def display_samples(samples, num_samples=5):
+    plt.figure(figsize=(15, 5))
+    for i in range(min(num_samples, len(samples))):
+        p, x1, y1, x2, y2, lab = samples[i]
+        img  = cv2.imread(p)
+        img  = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        crop = img[y1:y2, x1:x2]
+
+        plt.subplot(1, num_samples, i + 1)
+        plt.imshow(crop)
+        plt.title(f"Class: {class_names[lab]}")
+        plt.axis('off')
+    plt.tight_layout()
+    plt.show()
+
+print("\nSample 'gun' images:")
+gun_samples = [s for s in all_samples if s[-1] == 0]
+display_samples(gun_samples)
+
+print("\nSample 'knife' images:")
+knife_samples = [s for s in all_samples if s[-1] == 1]
+display_samples(knife_samples)
