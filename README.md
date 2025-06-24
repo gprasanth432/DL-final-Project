@@ -65,3 +65,7 @@ TinyCNN(
 
 Update :
 Model creation and training is done, model class created, model training function created, model trained
+
+
+Update:
+Performed evaluation on the test data and visualized the model's performance and dataset.
