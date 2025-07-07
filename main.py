@@ -777,3 +777,612 @@ print(model)
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
 scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
+
+print("\nCreating enhanced datasets...")
+
+train_transforms, val_transforms = create_enhanced_transforms()
+
+train_ds, val_ds, test_ds = create_enhanced_datasets_for_existing_code(
+    train_samples,
+    val_samples,
+    test_samples,
+    hp_train_samples,
+    hp_val_samples
+)
+
+train_loader = DataLoader(train_ds, batch_size=64, shuffle=True, num_workers=2, pin_memory=True) # Increased batch size
+val_loader   = DataLoader(val_ds, batch_size=64, shuffle=False, num_workers=2, pin_memory=True) # Increased batch size
+
+print(f"\nTrain batches: {len(train_loader)} | Val batches: {len(val_loader)}")
+
+print("\nStarting training...")
+
+history_enhanced_tinycnn = {
+    "train_loss": [],
+    "train_acc": [],
+    "val_loss": [],
+    "val_acc": [],
+}
+
+best_val_acc = 0.0
+best_model_path = 'enhanced_tinycnn_with_negatives.pt'
+
+for epoch in range(1, num_epochs + 1):
+    train_loss, train_acc = train_one_epoch_enhanced(
+        model, train_loader, criterion, optimizer, device
+    )
+
+    val_loss, val_acc, val_preds, val_targets = validate_enhanced(
+        model, val_loader, criterion, device
+    )
+
+    scheduler.step()
+
+    history_enhanced_tinycnn["train_loss"].append(train_loss)
+    history_enhanced_tinycnn["train_acc"].append(train_acc)
+    history_enhanced_tinycnn["val_loss"].append(val_loss)
+    history_enhanced_tinycnn["val_acc"].append(val_acc)
+
+    if val_acc > best_val_acc:
+        best_val_acc = val_acc
+        torch.save(model.state_dict(), best_model_path)
+        print(f"Saved best model at epoch {epoch} with Val Acc: {val_acc:.4f}")
+
+    print(f"Epoch {epoch}/{num_epochs}")
+    print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
+    print(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
+
+print(f"\nBest model saved to {best_model_path} with Val Acc: {best_val_acc:.4f}")
+
+print("\nEvaluating model on test set...")
+
+class_names = ['gun', 'knife']
+valid_labels = [0, 1]
+
+
+test_loader = DataLoader(test_ds, batch_size=64, shuffle=False, num_workers=2, pin_memory=True)
+
+
+test_loss, test_acc, test_preds, test_targets = validate_enhanced(
+    model, test_loader, criterion, device
+)
+
+precision, recall, f1, support = precision_recall_fscore_support(
+    test_targets, test_preds, average=None, labels=valid_labels
+)
+cm = confusion_matrix(test_targets, test_preds, labels=[0, 1, 2])
+
+
+print(f"\nTest Loss: {test_loss:.4f} | Test Accuracy: {test_acc:.4f}")
+print("\nClassification Report (Gun and Knife Only):")
+print(classification_report(test_targets, test_preds, labels=valid_labels, target_names=class_names))
+
+print("\nConfusion Matrix (including predictions into 'human_part'):")
+print(cm)
+
+
+misclassified_as_human = sum(
+    1 for t, p in zip(test_targets, test_preds) if t in valid_labels and p == 2
+)
+print(f"\nNumber of weapon samples (gun/knife) misclassified as 'human_part': {misclassified_as_human}")
+
+
+history_enhanced_tinycnn["test_loss"] = test_loss
+history_enhanced_tinycnn["test_acc"] = test_acc
+history_enhanced_tinycnn["test_precision"] = precision
+history_enhanced_tinycnn["test_recall"] = recall
+history_enhanced_tinycnn["test_f1"] = f1
+history_enhanced_tinycnn["test_confusion_matrix"] = cm
+history_enhanced_tinycnn["test_misclassified_as_human_part"] = misclassified_as_human
+
+import matplotlib.pyplot as plt
+
+train_loss = history_enhanced_tinycnn["train_loss"]
+val_loss   = history_enhanced_tinycnn["val_loss"]
+train_acc  = history_enhanced_tinycnn["train_acc"]
+val_acc    = history_enhanced_tinycnn["val_acc"]
+test_acc   = history_enhanced_tinycnn.get("test_acc", None)
+
+epochs = range(1, len(train_loss) + 1)
+
+
+plt.figure(figsize=(10, 4))
+
+plt.subplot(1, 2, 1)
+plt.plot(epochs, train_loss, 'b-o', label='Train Loss')
+plt.plot(epochs, val_loss, 'r-o', label='Val Loss')
+plt.title("Loss per Epoch")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.legend()
+plt.grid(True)
+
+
+plt.subplot(1, 2, 2)
+plt.plot(epochs, train_acc, 'b-o', label='Train Acc')
+plt.plot(epochs, val_acc, 'r-o', label='Val Acc')
+if test_acc is not None:
+    plt.axhline(test_acc, color='g', linestyle='--', label=f'Test Acc = {test_acc:.2f}')
+plt.title("Accuracy per Epoch")
+plt.xlabel("Epoch")
+plt.ylabel("Accuracy")
+plt.legend()
+plt.grid(True)
+
+plt.tight_layout()
+plt.show()
+
+"""Implement a small Vision Transformer (ViT) model suitable for 32x32 images and a 3-class classification problem.
+
+
+"""
+
+import torch.nn as nn
+import torch
+
+class PatchEmbed(nn.Module):
+    """ Image to Patch Embedding
+    """
+    def __init__(self, img_size=32, patch_size=4, in_chans=3, embed_dim=96):
+        super().__init__()
+        num_patches = (img_size // patch_size) * (img_size // patch_size)
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.num_patches = num_patches
+
+        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        # FIXME look at relaxing size constraints
+        assert H == self.img_size and W == self.img_size, \
+            f"Input image size ({H}*{W}) doesn't match model ({self.img_size}*{self.img_size})."
+        x = self.proj(x).flatten(2).transpose(1, 2)
+        return x
+
+class Mlp(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+class Attention(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim ** -0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+class Block(nn.Module):
+    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
+                 act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+        super().__init__()
+        self.norm1 = norm_layer(dim)
+        self.attn = Attention(
+            dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
+        self.norm2 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+class TinyViT(nn.Module):
+    """ Very small Vision Transformer model
+    """
+    def __init__(self, img_size=32, patch_size=4, in_chans=3, num_classes=3, embed_dim=96, depth=4,
+                 num_heads=3, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
+                 norm_layer=nn.LayerNorm):
+        super().__init__()
+        self.num_classes = num_classes
+        self.num_features = self.embed_dim = embed_dim
+
+        self.patch_embed = PatchEmbed(
+            img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
+        num_patches = self.patch_embed.num_patches
+
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
+        self.pos_drop = nn.Dropout(p=drop_rate)
+
+        self.blocks = nn.ModuleList([
+            Block(
+                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                drop=drop_rate, attn_drop=attn_drop_rate, norm_layer=norm_layer)
+            for i in range(depth)])
+
+        self.norm = norm_layer(embed_dim)
+
+        self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
+
+    def forward_features(self, x):
+        B = x.shape[0]
+        x = self.patch_embed(x)
+
+        x = x + self.pos_embed
+        x = self.pos_drop(x)
+
+        for blk in self.blocks:
+            x = blk(x)
+
+        x = self.norm(x)
+        return x.mean(dim=1)
+
+    def forward(self, x):
+        x = self.forward_features(x)
+        x = self.head(x)
+        return x
+
+print("Defined TinyViT model.")
+
+sample_vit_model = TinyViT(img_size=32, patch_size=4, num_classes=3, embed_dim=96, depth=4, num_heads=3)
+print("\nSample TinyViT model instance:")
+print(sample_vit_model)
+
+num_epochs = 20
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+model = TinyViT(img_size=32, patch_size=4, num_classes=3, embed_dim=96, depth=4, num_heads=3).to(device)
+print("Model ready.")
+
+criterion = nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
+
+train_transforms, val_transforms = create_enhanced_transforms()
+train_ds, val_ds, test_ds = create_enhanced_datasets_for_existing_code(
+    train_samples, val_samples, test_samples, hp_train_samples, hp_val_samples
+)
+train_loader = DataLoader(train_ds, batch_size=64, shuffle=True, num_workers=0)
+val_loader = DataLoader(val_ds, batch_size=64, shuffle=False, num_workers=0)
+
+history_tinyvit = {
+    "train_loss": [], "train_acc": [],
+    "val_loss": [], "val_acc": []
+}
+best_val_acc = 0.0
+best_model_path = 'tinyvit_with_negatives.pt'
+
+for epoch in range(1, num_epochs + 1):
+    train_loss, train_acc = train_one_epoch_enhanced(model, train_loader, criterion, optimizer, device)
+    val_loss, val_acc, _, _ = validate_enhanced(model, val_loader, criterion, device)
+
+    history_tinyvit["train_loss"].append(train_loss)
+    history_tinyvit["train_acc"].append(train_acc)
+    history_tinyvit["val_loss"].append(val_loss)
+    history_tinyvit["val_acc"].append(val_acc)
+
+    if val_acc > best_val_acc:
+        best_val_acc = val_acc
+        torch.save(model.state_dict(), best_model_path)
+        print(f"Epoch {epoch} | Saved best model with val acc {val_acc:.4f}")
+
+    scheduler.step()
+    print(f"Epoch {epoch} | Train Loss: {train_loss:.4f}, Acc: {train_acc:.4f} | Val Loss: {val_loss:.4f}, Acc: {val_acc:.4f}")
+
+from sklearn.metrics import classification_report, confusion_matrix, precision_recall_fscore_support
+
+class_names = ['gun', 'knife', 'human_part']
+print("\nEvaluating model on test set...")
+
+test_loader = DataLoader(test_ds, batch_size=64, shuffle=False, num_workers=2, pin_memory=True)
+
+test_loss, test_acc, test_preds, test_targets = validate_enhanced(
+    model, test_loader, criterion, device
+)
+
+precision, recall, f1, support = precision_recall_fscore_support(
+    test_targets, test_preds, average=None, labels=[0, 1, 2], zero_division=0
+)
+cm = confusion_matrix(test_targets, test_preds, labels=[0, 1, 2])
+
+print(f"\nTest Loss: {test_loss:.4f} | Test Accuracy: {test_acc:.4f}")
+print("\nClassification Report:")
+print(classification_report(
+    test_targets, test_preds, target_names=class_names, zero_division=0
+))
+print("\nConfusion Matrix:")
+print(cm)
+
+history_tinyvit["test_loss"] = test_loss
+history_tinyvit["test_acc"] = test_acc
+history_tinyvit["test_precision"] = precision
+history_tinyvit["test_recall"] = recall
+history_tinyvit["test_f1"] = f1
+history_tinyvit["test_confusion_matrix"] = cm
+
+import matplotlib.pyplot as plt
+
+train_loss = history_tinyvit["train_loss"]
+val_loss   = history_tinyvit["val_loss"]
+train_acc  = history_tinyvit["train_acc"]
+val_acc    = history_tinyvit["val_acc"]
+test_acc   = history_tinyvit.get("test_acc", None)
+
+epochs = range(1, len(train_loss) + 1)
+
+
+plt.figure(figsize=(10, 4))
+
+plt.subplot(1, 2, 1)
+plt.plot(epochs, train_loss, 'b-o', label='Train Loss')
+plt.plot(epochs, val_loss, 'r-o', label='Val Loss')
+plt.title("Loss per Epoch")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.legend()
+plt.grid(True)
+
+
+plt.subplot(1, 2, 2)
+plt.plot(epochs, train_acc, 'b-o', label='Train Acc')
+plt.plot(epochs, val_acc, 'r-o', label='Val Acc')
+if test_acc is not None:
+    plt.axhline(test_acc, color='g', linestyle='--', label=f'Test Acc = {test_acc:.2f}')
+plt.title("Accuracy per Epoch")
+plt.xlabel("Epoch")
+plt.ylabel("Accuracy")
+plt.legend()
+plt.grid(True)
+
+plt.tight_layout()
+plt.show()
+
+"""## Tuned tinyvit"""
+
+from torchvision import transforms
+from torch.utils.data import DataLoader
+import torch.optim as optim
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Device: {device}")
+
+model = TinyViT(img_size=32, patch_size=4, num_classes=3, embed_dim=96, depth=4, num_heads=3).to(device)
+
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=0.0005, weight_decay=1e-5)
+scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
+
+train_transforms, val_transforms = create_enhanced_transforms()
+train_ds, val_ds, test_ds = create_enhanced_datasets_for_existing_code(
+    train_samples, val_samples, test_samples, hp_train_samples, hp_val_samples
+)
+train_loader = DataLoader(train_ds, batch_size=64, shuffle=True, num_workers=2, pin_memory=True)
+val_loader = DataLoader(val_ds, batch_size=64, shuffle=False, num_workers=2, pin_memory=True)
+
+print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
+
+history_tuned_tinyvit = {
+    "train_loss": [], "train_acc": [],
+    "val_loss": [], "val_acc": []
+}
+best_val_acc = 0.0
+best_model_path = 'tuned_tinyvit_with_negatives.pt'
+
+print("Training started...")
+for epoch in range(1, 31):
+    train_loss, train_acc = train_one_epoch_enhanced(model, train_loader, criterion, optimizer, device)
+    val_loss, val_acc, _, _ = validate_enhanced(model, val_loader, criterion, device)
+
+    history_tuned_tinyvit["train_loss"].append(train_loss)
+    history_tuned_tinyvit["train_acc"].append(train_acc)
+    history_tuned_tinyvit["val_loss"].append(val_loss)
+    history_tuned_tinyvit["val_acc"].append(val_acc)
+
+    if val_acc > best_val_acc:
+        best_val_acc = val_acc
+        torch.save(model.state_dict(), best_model_path)
+        print(f"Epoch {epoch} | Best model saved with val acc: {val_acc:.4f}")
+
+    scheduler.step()
+    print(f"Epoch {epoch} | Train Loss: {train_loss:.4f}, Acc: {train_acc:.4f} | Val Loss: {val_loss:.4f}, Acc: {val_acc:.4f}")
+
+from sklearn.metrics import classification_report, confusion_matrix, precision_recall_fscore_support
+import numpy as np
+
+model.load_state_dict(torch.load("tuned_tinyvit_with_negatives.pt"))
+model.eval()
+
+test_loader = DataLoader(test_ds, batch_size=64, shuffle=False, num_workers=2, pin_memory=True)
+test_preds, test_targets = [], []
+
+with torch.no_grad():
+    for x, y in test_loader:
+        x, y = x.to(device), y.to(device)
+        outputs = model(x)
+        preds = outputs.argmax(dim=1)
+        test_preds.extend(preds.cpu().numpy())
+        test_targets.extend(y.cpu().numpy())
+
+test_preds = np.array(test_preds)
+test_targets = np.array(test_targets)
+test_loss, test_acc, _, _ = validate_enhanced(model, test_loader, criterion, device)
+
+class_names = ['gun', 'knife', 'human_part']
+unique_labels = np.unique(test_targets)
+target_names_subset = [class_names[i] for i in unique_labels]
+precision, recall, f1, support = precision_recall_fscore_support(
+    test_targets, test_preds, average=None, labels=unique_labels, zero_division=0
+)
+cm = confusion_matrix(test_targets, test_preds, labels=[0, 1, 2])
+
+print(f"Test Loss: {test_loss:.4f} | Test Accuracy: {test_acc:.4f}")
+print("\nClassification Report:")
+print(classification_report(test_targets, test_preds, labels=unique_labels, target_names=target_names_subset, zero_division=0))
+print("\nConfusion Matrix:")
+print(cm)
+
+history_tuned_tinyvit["test_loss"] = test_loss
+history_tuned_tinyvit["test_acc"] = test_acc
+history_tuned_tinyvit["test_precision"] = precision
+history_tuned_tinyvit["test_recall"] = recall
+history_tuned_tinyvit["test_f1"] = f1
+history_tuned_tinyvit["test_confusion_matrix"] = cm
+
+import matplotlib.pyplot as plt
+
+train_loss = history_tuned_tinyvit["train_loss"]
+val_loss   = history_tuned_tinyvit["val_loss"]
+train_acc  = history_tuned_tinyvit["train_acc"]
+val_acc    = history_tuned_tinyvit["val_acc"]
+test_acc   = history_tuned_tinyvit.get("test_acc", None)
+
+epochs = range(1, len(train_loss) + 1)
+
+
+plt.figure(figsize=(10, 4))
+
+plt.subplot(1, 2, 1)
+plt.plot(epochs, train_loss, 'b-o', label='Train Loss')
+plt.plot(epochs, val_loss, 'r-o', label='Val Loss')
+plt.title("Loss per Epoch")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.legend()
+plt.grid(True)
+
+
+plt.subplot(1, 2, 2)
+plt.plot(epochs, train_acc, 'b-o', label='Train Acc')
+plt.plot(epochs, val_acc, 'r-o', label='Val Acc')
+if test_acc is not None:
+    plt.axhline(test_acc, color='g', linestyle='--', label=f'Test Acc = {test_acc:.2f}')
+plt.title("Accuracy per Epoch")
+plt.xlabel("Epoch")
+plt.ylabel("Accuracy")
+plt.legend()
+plt.grid(True)
+
+plt.tight_layout()
+plt.show()
+
+"""Mix_tinyvit"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+
+def mixup_data(x, y, alpha=1.0, device='cuda'):
+    lam = np.random.beta(alpha, alpha) if alpha > 0 else 1
+    index = torch.randperm(x.size(0)).to(device)
+    mixed_x = lam * x + (1 - lam) * x[index]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam
+
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
+
+class PatchEmbed(nn.Module):
+    def __init__(self, img_size=32, patch_size=4, in_chans=3, embed_dim=96):
+        super().__init__()
+        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+
+    def forward(self, x):
+        x = self.proj(x).flatten(2).transpose(1, 2)
+        return x
+
+class Mlp(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
+        super().__init__()
+        hidden_features = hidden_features or in_features
+        out_features = out_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.drop(self.fc2(self.act(self.fc1(x))))
+        return x
+
+class Attention(nn.Module):
+    def __init__(self, dim, num_heads, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim ** -0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj_drop(self.proj(x))
+        return x
+
+class Block(nn.Module):
+    def __init__(self, dim, num_heads, mlp_ratio=4., drop=0., attn_drop=0., norm_layer=nn.LayerNorm):
+        super().__init__()
+        self.norm1 = norm_layer(dim)
+        self.attn = Attention(dim, num_heads, attn_drop=attn_drop, proj_drop=drop)
+        self.norm2 = norm_layer(dim)
+        self.mlp = Mlp(dim, int(dim * mlp_ratio), act_layer=nn.GELU, drop=drop)
+
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+class TinyViT(nn.Module):
+    def __init__(self, img_size=32, patch_size=4, in_chans=3, num_classes=3, embed_dim=96, depth=4, num_heads=3):
+        super().__init__()
+        self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim)
+        self.pos_embed = nn.Parameter(torch.zeros(1, (img_size // patch_size)**2, embed_dim))
+        self.pos_drop = nn.Dropout(0.)
+        self.blocks = nn.Sequential(*[
+            Block(embed_dim, num_heads, mlp_ratio=4., drop=0., attn_drop=0.)
+            for _ in range(depth)
+        ])
+        self.norm = nn.LayerNorm(embed_dim)
+        self.head = nn.Linear(embed_dim, num_classes)
+
+    def forward_features(self, x):
+        x = self.patch_embed(x) + self.pos_embed
+        x = self.pos_drop(x)
+        x = self.blocks(x)
+        return self.norm(x).mean(dim=1)
+
+    def forward(self, x):
+        return self.head(self.forward_features(x))
