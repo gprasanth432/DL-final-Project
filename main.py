@@ -777,3 +777,826 @@ print(model)
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
 scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
+
+
+class TinyViT(nn.Module):
+    def __init__(self, img_size=32, patch_size=4, in_chans=3, num_classes=3, embed_dim=96, depth=4, num_heads=3):
+        super().__init__()
+        self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim)
+        self.pos_embed = nn.Parameter(torch.zeros(1, (img_size // patch_size)**2, embed_dim))
+        self.pos_drop = nn.Dropout(0.)
+        self.blocks = nn.Sequential(*[
+            Block(embed_dim, num_heads, mlp_ratio=4., drop=0., attn_drop=0.)
+            for _ in range(depth)
+        ])
+        self.norm = nn.LayerNorm(embed_dim)
+        self.head = nn.Linear(embed_dim, num_classes)
+
+    def forward_features(self, x):
+        x = self.patch_embed(x) + self.pos_embed
+        x = self.pos_drop(x)
+        x = self.blocks(x)
+        return self.norm(x).mean(dim=1)
+
+    def forward(self, x):
+        return self.head(self.forward_features(x))
+
+import os
+import cv2
+import torch
+import random
+import numpy as np
+from collections import Counter
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+
+class EnhancedWeaponCropDataset(Dataset):
+    def __init__(self, weapon_samples, human_parts_samples=None, transform=None,
+                 balance_classes=True, max_human_parts=None):
+        self.samples = []
+        self.transform = transform
+
+        self.samples.extend(weapon_samples)
+
+        if human_parts_samples:
+            if max_human_parts and len(human_parts_samples) > max_human_parts:
+                human_parts_samples = random.sample(human_parts_samples, max_human_parts)
+            for img_path, x1, y1, x2, y2, _ in human_parts_samples:
+                self.samples.append((img_path, x1, y1, x2, y2, 2))  # class_id=2 for human_part
+
+        if balance_classes:
+            self._balance_classes()
+        self._print_class_distribution()
+
+    def _balance_classes(self):
+        class_samples = {0: [], 1: [], 2: []}
+        for sample in self.samples:
+            class_id = sample[5]
+            class_samples[class_id].append(sample)
+
+        min_len = min(len(v) for v in class_samples.values() if v)
+        balanced = []
+        for v in class_samples.values():
+            balanced.extend(random.sample(v, min_len))
+        self.samples = balanced
+
+    def _print_class_distribution(self):
+        dist = Counter([s[5] for s in self.samples])
+        for cid in sorted(dist.keys()):
+            print(f"Class {cid}: {dist[cid]} samples")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        img_path, x1, y1, x2, y2, class_id = self.samples[idx]
+        img = cv2.imread(img_path)
+        if img is None:
+            return torch.zeros(3, 32, 32), 0
+        h, w = img.shape[:2]
+        x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
+        crop = img[y1:y2, x1:x2] if x2 > x1 and y2 > y1 else np.zeros((32, 32, 3), dtype=np.uint8)
+        if self.transform:
+            crop = self.transform(crop)
+        return crop, class_id
+
+def create_enhanced_transforms():
+    train_tfms = transforms.Compose([
+        transforms.ToPILImage(),
+        transforms.Resize((32, 32)),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(15),
+        transforms.ColorJitter(0.2, 0.2, 0.2, 0.1),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+    val_tfms = transforms.Compose([
+        transforms.ToPILImage(),
+        transforms.Resize((32, 32)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+    return train_tfms, val_tfms
+
+def train_one_epoch_mixup(model, dataloader, criterion, optimizer, device, mixup_alpha=0.4):
+    model.train()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+
+    for batch_idx, (inputs, targets) in enumerate(dataloader):
+        inputs, targets = inputs.to(device), targets.to(device)
+
+        inputs, targets_a, targets_b, lam = mixup_data(inputs, targets, mixup_alpha, device)
+
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = mixup_criterion(criterion, outputs, targets_a, targets_b, lam)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * inputs.size(0)
+
+        _, predicted = outputs.max(1)
+        total += targets.size(0)
+        correct += (
+            lam * predicted.eq(targets_a.data).sum().item() +
+            (1 - lam) * predicted.eq(targets_b.data).sum().item()
+        )
+
+    avg_loss = running_loss / total
+    accuracy = correct / total
+    return avg_loss, accuracy
+
+import pickle
+
+history_mixup_tinyvit = {
+    "train_loss": [], "train_acc": [],
+    "val_loss": [], "val_acc": []
+}
+
+best_val_acc = 0.0
+best_model_path = "mixup_tinyvit_with_negatives.pt"
+patience = 5
+epochs_no_improve = 0
+
+for epoch in range(1, num_epochs + 1):
+    train_loss, train_acc = train_one_epoch_mixup(
+        model, train_loader, criterion, optimizer, device, mixup_alpha=0.4
+    )
+
+    val_loss, val_acc, val_preds, val_targets = validate_enhanced(
+        model, val_loader, criterion, device
+    )
+
+    history_mixup_tinyvit["train_loss"].append(train_loss)
+    history_mixup_tinyvit["train_acc"].append(train_acc)
+    history_mixup_tinyvit["val_loss"].append(val_loss)
+    history_mixup_tinyvit["val_acc"].append(val_acc)
+
+    if val_acc > best_val_acc:
+        best_val_acc = val_acc
+        epochs_no_improve = 0
+        torch.save(model.state_dict(), best_model_path)
+        print(f"Epoch {epoch} | Saved best model with val acc {val_acc:.4f}")
+    else:
+        epochs_no_improve += 1
+        print(f"Epoch {epoch} | No improvement. {epochs_no_improve}/{patience} early stop patience.")
+
+    scheduler.step()
+    print(f"Epoch {epoch}/{num_epochs} | Train Loss: {train_loss:.4f}, Acc: {train_acc:.4f} | Val Loss: {val_loss:.4f}, Acc: {val_acc:.4f}")
+
+    if epochs_no_improve >= patience:
+        print(f"\nEarly stopping triggered at epoch {epoch}. Best Val Acc: {best_val_acc:.4f}")
+        break
+
+from sklearn.metrics import classification_report, confusion_matrix, precision_recall_fscore_support
+
+class_names = ['gun', 'knife', 'human_part']
+print("\nEvaluating model on test set...")
+
+test_loader = DataLoader(test_ds, batch_size=64, shuffle=False, num_workers=2, pin_memory=True)
+
+test_loss, test_acc, test_preds, test_targets = validate_enhanced(
+    model, test_loader, criterion, device
+)
+
+precision, recall, f1, support = precision_recall_fscore_support(
+    test_targets, test_preds, average=None, labels=[0, 1, 2], zero_division=0
+)
+cm = confusion_matrix(test_targets, test_preds, labels=[0, 1, 2])
+
+print(f"\nTest Loss: {test_loss:.4f} | Test Accuracy: {test_acc:.4f}")
+print("\nClassification Report:")
+print(classification_report(
+    test_targets, test_preds, target_names=class_names, zero_division=0
+))
+print("\nConfusion Matrix:")
+print(cm)
+
+history_mixup_tinyvit["test_loss"] = test_loss
+history_mixup_tinyvit["test_acc"] = test_acc
+history_mixup_tinyvit["test_precision"] = precision
+history_mixup_tinyvit["test_recall"] = recall
+history_mixup_tinyvit["test_f1"] = f1
+history_mixup_tinyvit["test_confusion_matrix"] = cm
+
+import matplotlib.pyplot as plt
+
+train_loss = history_mixup_tinyvit["train_loss"]
+val_loss   = history_mixup_tinyvit["val_loss"]
+train_acc  = history_mixup_tinyvit["train_acc"]
+val_acc    = history_mixup_tinyvit["val_acc"]
+test_acc   = history_mixup_tinyvit.get("test_acc", None)
+
+epochs = range(1, len(train_loss) + 1)
+
+
+plt.figure(figsize=(10, 4))
+
+plt.subplot(1, 2, 1)
+plt.plot(epochs, train_loss, 'b-o', label='Train Loss')
+plt.plot(epochs, val_loss, 'r-o', label='Val Loss')
+plt.title("Loss per Epoch")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.legend()
+plt.grid(True)
+
+
+plt.subplot(1, 2, 2)
+plt.plot(epochs, train_acc, 'b-o', label='Train Acc')
+plt.plot(epochs, val_acc, 'r-o', label='Val Acc')
+if test_acc is not None:
+    plt.axhline(test_acc, color='g', linestyle='--', label=f'Test Acc = {test_acc:.2f}')
+plt.title("Accuracy per Epoch")
+plt.xlabel("Epoch")
+plt.ylabel("Accuracy")
+plt.legend()
+plt.grid(True)
+
+plt.tight_layout()
+plt.show()
+
+"""## training vit with mixup and weight decay changes"""
+
+import torch
+import torch.nn as nn
+import numpy as np
+import random
+from torch.utils.data import DataLoader
+import pickle
+
+def mixup_data(x, y, alpha=0.4, device='cuda'):
+    lam = np.random.beta(alpha, alpha) if alpha > 0 else 1
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size).to(device)
+    mixed_x = lam * x + (1 - lam) * x[index]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam
+
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
+
+def train_one_epoch_mixup(model, loader, criterion, optimizer, device, mixup_alpha=0.4):
+    model.train()
+    total_loss, correct, total = 0.0, 0, 0
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        x, y_a, y_b, lam = mixup_data(x, y, alpha=mixup_alpha, device=device)
+        optimizer.zero_grad()
+        outputs = model(x)
+        loss = mixup_criterion(criterion, outputs, y_a, y_b, lam)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item() * x.size(0)
+        preds = outputs.argmax(1)
+        correct += (lam * preds.eq(y_a).sum().item() + (1 - lam) * preds.eq(y_b).sum().item())
+        total += y.size(0)
+    return total_loss / total, correct / total
+
+from sklearn.metrics import classification_report, confusion_matrix, precision_recall_fscore_support
+
+def validate_enhanced(model, loader, criterion, device):
+    model.eval()
+    loss_total, correct, total = 0.0, 0, 0
+    all_preds, all_targets = [], []
+    with torch.no_grad():
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
+            outputs = model(x)
+            loss = criterion(outputs, y)
+            preds = outputs.argmax(1)
+            loss_total += loss.item() * x.size(0)
+            correct += preds.eq(y).sum().item()
+            total += y.size(0)
+            all_preds.extend(preds.cpu().numpy())
+            all_targets.extend(y.cpu().numpy())
+    return loss_total / total, correct / total, all_preds, all_targets
+
+def comprehensive_evaluation(model, loader, device, class_names):
+    model.eval()
+    all_preds, all_targets = [], []
+    with torch.no_grad():
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
+            outputs = model(x)
+            preds = outputs.argmax(1)
+            all_preds.extend(preds.cpu().numpy())
+            all_targets.extend(y.cpu().numpy())
+    accuracy = np.mean(np.array(all_preds) == np.array(all_targets))
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        all_targets, all_preds, average=None, labels=[0, 1, 2], zero_division=0
+    )
+    cm = confusion_matrix(all_targets, all_preds, labels=[0, 1, 2])
+    return accuracy, precision, recall, f1, cm
+
+criterion = nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.0005, weight_decay=1e-5)
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
+
+num_epochs = 30
+mixup_alpha = 0.4
+best_val_acc = 0.0
+patience = 5
+epochs_no_improve = 0
+best_model_path = "mixup_wd_tinyvit_with_negatives.pt"
+
+history_mixup_wd_tinyvit = {
+    "train_loss": [], "train_acc": [],
+    "val_loss": [], "val_acc": []
+}
+
+for epoch in range(1, num_epochs + 1):
+    train_loss, train_acc = train_one_epoch_mixup(model, train_loader, criterion, optimizer, device, mixup_alpha)
+    val_loss, val_acc, _, _ = validate_enhanced(model, val_loader, criterion, device)
+
+    history_mixup_wd_tinyvit["train_loss"].append(train_loss)
+    history_mixup_wd_tinyvit["train_acc"].append(train_acc)
+    history_mixup_wd_tinyvit["val_loss"].append(val_loss)
+    history_mixup_wd_tinyvit["val_acc"].append(val_acc)
+
+    if val_acc > best_val_acc:
+        best_val_acc = val_acc
+        epochs_no_improve = 0
+        torch.save(model.state_dict(), best_model_path)
+        print(f"Epoch {epoch} | Saved best model with val acc {val_acc:.4f}")
+
+    scheduler.step()
+    print(f"Epoch {epoch}/{num_epochs} | Train Loss: {train_loss:.4f}, Acc: {train_acc:.4f} | Val Loss: {val_loss:.4f}, Acc: {val_acc:.4f}")
+
+    if epochs_no_improve >= patience:
+        print(f"\nEarly stopping triggered at epoch {epoch}. Best Val Acc: {best_val_acc:.4f}")
+        break
+
+model.load_state_dict(torch.load("/content/mixup_wd_tinyvit_with_negatives.pt"))
+model.eval()
+
+test_loss, test_acc, test_preds, test_targets = validate_enhanced(model, test_loader, criterion, device)
+
+from sklearn.metrics import classification_report, confusion_matrix, precision_recall_fscore_support
+
+class_names = ['gun', 'knife', 'human_part']
+
+precision, recall, f1, support = precision_recall_fscore_support(
+    test_targets, test_preds, average=None, labels=[0, 1, 2], zero_division=0
+)
+report = classification_report(test_targets, test_preds, target_names=class_names, digits=4, zero_division=0)
+cm = confusion_matrix(test_targets, test_preds, labels=[0, 1, 2])
+
+print(f"\n=== TEST EVALUATION ===")
+print(f"Test Loss: {test_loss:.4f} | Test Accuracy: {test_acc:.4f}")
+print("\nClassification Report:")
+print(report)
+print("Confusion Matrix:")
+print(cm)
+
+
+history_mixup_wd_tinyvit["test_loss"] = test_loss
+history_mixup_wd_tinyvit["test_acc"] = test_acc
+history_mixup_wd_tinyvit["test_precision"] = precision
+history_mixup_wd_tinyvit["test_recall"] = recall
+history_mixup_wd_tinyvit["test_f1"] = f1
+history_mixup_wd_tinyvit["test_confusion_matrix"] = cm
+
+print(history_mixup_wd_tinyvit)
+
+import matplotlib.pyplot as plt
+
+train_loss = history_mixup_wd_tinyvit["train_loss"]
+val_loss   = history_mixup_wd_tinyvit["val_loss"]
+train_acc  = history_mixup_wd_tinyvit["train_acc"]
+val_acc    = history_mixup_wd_tinyvit["val_acc"]
+test_acc   = history_mixup_wd_tinyvit.get("test_acc", None)
+
+epochs = range(1, len(train_loss) + 1)
+
+
+plt.figure(figsize=(10, 4))
+
+plt.subplot(1, 2, 1)
+plt.plot(epochs, train_loss, 'b-o', label='Train Loss')
+plt.plot(epochs, val_loss, 'r-o', label='Val Loss')
+plt.title("Loss per Epoch")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.legend()
+plt.grid(True)
+
+
+plt.subplot(1, 2, 2)
+plt.plot(epochs, train_acc, 'b-o', label='Train Acc')
+plt.plot(epochs, val_acc, 'r-o', label='Val Acc')
+if test_acc is not None:
+    plt.axhline(test_acc, color='g', linestyle='--', label=f'Test Acc = {test_acc:.2f}')
+plt.title("Accuracy per Epoch")
+plt.xlabel("Epoch")
+plt.ylabel("Accuracy")
+plt.legend()
+plt.grid(True)
+
+plt.tight_layout()
+plt.show()
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class BasicBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, in_planes, planes, stride=1, downsample=None):
+        super(BasicBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride,
+                               padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.relu = nn.ReLU(inplace=True)
+
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1,
+                               padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
+
+        self.downsample = downsample
+
+    def forward(self, x):
+        identity = x
+
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out += identity
+        out = self.relu(out)
+        return out
+
+
+class CustomResNet18(nn.Module):
+    def __init__(self, num_classes=3):
+        super(CustomResNet18, self).__init__()
+        self.in_planes = 64
+
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+
+        self.layer1 = self._make_layer(BasicBlock, 64, 2)
+        self.layer2 = self._make_layer(BasicBlock, 128, 2, stride=2)
+        self.layer3 = self._make_layer(BasicBlock, 256, 2, stride=2)
+        self.layer4 = self._make_layer(BasicBlock, 512, 2, stride=2)
+
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(512 * BasicBlock.expansion, num_classes)
+
+    def _make_layer(self, block, planes, blocks, stride=1):
+        downsample = None
+        if stride != 1 or self.in_planes != planes * block.expansion:
+            downsample = nn.Sequential(
+                nn.Conv2d(self.in_planes, planes * block.expansion,
+                          kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(planes * block.expansion),
+            )
+
+        layers = [block(self.in_planes, planes, stride, downsample)]
+        self.in_planes = planes * block.expansion
+        for _ in range(1, blocks):
+            layers.append(block(self.in_planes, planes))
+
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.maxpool(x)
+
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.fc(x)
+        return x
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+num_classes = 3  # 'gun', 'knife', 'human_part'
+model_ft = CustomResNet18(num_classes=num_classes).to(device)
+print(f"Loaded custom-defined ResNet18 model with {num_classes} output classes.")
+
+for name, param in model_ft.named_parameters():
+    if 'fc' not in name:
+        param.requires_grad = False
+
+print("\nFroze feature extractor layers. Only classifier head will be trained initially.")
+
+criterion = nn.CrossEntropyLoss()
+optimizer_ft = optim.Adam(model_ft.fc.parameters(), lr=0.001)
+
+print("Defined CrossEntropyLoss and Adam optimizer for the classifier head.")
+
+!pip install torchinfo
+
+from torchinfo import summary
+
+summary(model_ft, input_size=(1, 3, 224, 224), col_names=["input_size", "output_size", "num_params", "trainable"])
+
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+from sklearn.metrics import classification_report, confusion_matrix, precision_recall_fscore_support
+
+
+def train_one_epoch_enhanced(model, dataloader, criterion, optimizer, device):
+    model.train()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+
+    for batch_idx, (data, target) in enumerate(dataloader):
+        data, target = data.to(device), target.to(device)
+
+        optimizer.zero_grad()
+        output = model(data)
+        loss = criterion(output, target)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item()
+        pred = output.argmax(dim=1)
+        correct += pred.eq(target).sum().item()
+        total += target.size(0)
+
+    avg_loss = running_loss / len(dataloader) if len(dataloader) > 0 else 0.0
+    accuracy = correct / total if total > 0 else 0.0
+
+    return avg_loss, accuracy
+
+def validate_enhanced(model, dataloader, criterion, device):
+    model.eval()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+    all_preds = []
+    all_targets = []
+
+    with torch.no_grad():
+        for data, target in dataloader:
+            data, target = data.to(device), target.to(device)
+            output = model(data)
+            loss = criterion(output, target)
+
+            running_loss += loss.item()
+            pred = output.argmax(dim=1)
+            correct += pred.eq(target).sum().item()
+            total += target.size(0)
+
+            all_preds.extend(pred.cpu().numpy())
+            all_targets.extend(target.cpu().numpy())
+
+    avg_loss = running_loss / len(dataloader) if len(dataloader) > 0 else 0.0
+    accuracy = correct / total if total > 0 else 0.0
+
+    return avg_loss, accuracy, all_preds, all_targets
+
+num_epochs_head = 5
+print(f"\nStarting initial training (classifier head only) for {num_epochs_head} epochs...")
+
+history_resnet18 = {
+    "train_loss": [], "train_acc": [],
+    "val_loss": [], "val_acc": []
+}
+
+best_val_acc = 0.0
+patience = 5
+epochs_no_improve = 0
+best_model_path = "resnet18_best_head_finetune.pt"
+
+for epoch in range(1, num_epochs_head + 1):
+    train_loss, train_acc = train_one_epoch_enhanced(
+        model_ft, train_loader, criterion, optimizer_ft, device
+    )
+
+    val_loss, val_acc, _, _ = validate_enhanced(
+        model_ft, val_loader, criterion, device
+    )
+
+    history_resnet18["train_loss"].append(train_loss)
+    history_resnet18["train_acc"].append(train_acc)
+    history_resnet18["val_loss"].append(val_loss)
+    history_resnet18["val_acc"].append(val_acc)
+
+    if val_acc > best_val_acc:
+        best_val_acc = val_acc
+        epochs_no_improve = 0
+        torch.save(model_ft.state_dict(), best_model_path)
+        print(f"Epoch {epoch} | Saved best model with val acc {val_acc:.4f}")
+
+    print(f"Epoch {epoch}/{num_epochs_head} (Head Only) | Train Loss: {train_loss:.4f}, Acc: {train_acc:.4f} | Val Loss: {val_loss:.4f}, Acc: {val_acc:.4f}")
+
+print("\nFinished initial training of classifier head.")
+
+print("\nUnfreezing all model layers for fine-tuning...")
+for param in model_ft.parameters():
+    param.requires_grad = True
+
+optimizer_fine_tune = optim.Adam(model_ft.parameters(), lr=0.0001, weight_decay=1e-5)
+scheduler_fine_tune = optim.lr_scheduler.StepLR(optimizer_fine_tune, step_size=10, gamma=0.1)
+
+num_epochs_fine_tune = 15
+print(f"\nStarting fine-tuning (entire model) for {num_epochs_fine_tune} epochs...")
+
+for epoch in range(1, num_epochs_fine_tune + 1):
+    train_loss, train_acc = train_one_epoch_enhanced(
+        model_ft, train_loader, criterion, optimizer_fine_tune, device
+    )
+
+    val_loss, val_acc, _, _ = validate_enhanced(
+        model_ft, val_loader, criterion, device
+    )
+
+    history_resnet18["train_loss"].append(train_loss)
+    history_resnet18["train_acc"].append(train_acc)
+    history_resnet18["val_loss"].append(val_loss)
+    history_resnet18["val_acc"].append(val_acc)
+
+    if val_acc > best_val_acc:
+        best_val_acc = val_acc
+        epochs_no_improve = 0
+        torch.save(model_ft.state_dict(), best_model_path)
+        print(f"Epoch {epoch} | Saved best model with val acc {val_acc:.4f}")
+
+    scheduler_fine_tune.step()
+
+    print(f"Epoch {epoch}/{num_epochs_fine_tune} (Fine-tuning) | Train Loss: {train_loss:.4f}, Acc: {train_acc:.4f} | Val Loss: {val_loss:.4f}, Acc: {val_acc:.4f}")
+
+    if epochs_no_improve >= patience:
+        print(f"\nEarly stopping triggered at epoch {epoch}. Best Val Acc: {best_val_acc:.4f}")
+        break
+
+import pickle
+from sklearn.metrics import precision_score, recall_score, f1_score
+
+best_model_path = "resnet18_best_head_finetune.pt"
+
+
+model_ft.load_state_dict(torch.load(best_model_path))
+model_ft.eval()
+print(f"\nLoaded best model from {best_model_path} for final test evaluation.")
+
+print("\nRunning final evaluation on test set...")
+test_loss, test_acc, test_preds, test_targets = validate_enhanced(
+    model_ft, test_loader, criterion, device
+)
+
+precision = precision_score(test_targets, test_preds, average="weighted", zero_division=0)
+recall = recall_score(test_targets, test_preds, average="weighted", zero_division=0)
+f1 = f1_score(test_targets, test_preds, average="weighted", zero_division=0)
+cm = confusion_matrix(test_targets, test_preds, labels=[0, 1, 2])
+
+print(f"\nTest Loss: {test_loss:.4f} | Test Accuracy: {test_acc:.4f}")
+print(f"Test Precision: {precision:.4f} | Recall: {recall:.4f} | F1-Score: {f1:.4f}")
+print("Test Confusion Matrix:\n", cm)
+
+history_resnet18["test_loss"] = test_loss
+history_resnet18["test_acc"] = test_acc
+history_resnet18["test_precision"] = precision
+history_resnet18["test_recall"] = recall
+history_resnet18["test_f1"] = f1
+history_resnet18["test_confusion_matrix"] = cm.tolist()  # Store as list for JSON compatibility
+
+import matplotlib.pyplot as plt
+
+train_loss = history_resnet18["train_loss"]
+val_loss   = history_resnet18["val_loss"]
+train_acc  = history_resnet18["train_acc"]
+val_acc    = history_resnet18["val_acc"]
+test_acc   = history_resnet18.get("test_acc", None)
+
+epochs = range(1, len(train_loss) + 1)
+
+
+plt.figure(figsize=(10, 4))
+
+plt.subplot(1, 2, 1)
+plt.plot(epochs, train_loss, 'b-o', label='Train Loss')
+plt.plot(epochs, val_loss, 'r-o', label='Val Loss')
+plt.title("Loss per Epoch")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.legend()
+plt.grid(True)
+
+
+plt.subplot(1, 2, 2)
+plt.plot(epochs, train_acc, 'b-o', label='Train Acc')
+plt.plot(epochs, val_acc, 'r-o', label='Val Acc')
+if test_acc is not None:
+    plt.axhline(test_acc, color='g', linestyle='--', label=f'Test Acc = {test_acc:.2f}')
+plt.title("Accuracy per Epoch")
+plt.xlabel("Epoch")
+plt.ylabel("Accuracy")
+plt.legend()
+plt.grid(True)
+
+plt.tight_layout()
+plt.show()
+
+models_histories = {
+    "baseline_tinycnn": history_baseline_tinycnn,
+    "enhanced_tinycnn": history_enhanced_tinycnn,
+    "tinyvit": history_tinyvit,
+    "tuned_tinyvit": history_tuned_tinyvit,
+    "mixup_tinyvit": history_mixup_tinyvit,
+    "mixup_wd_tinyvit": history_mixup_wd_tinyvit,
+    "resnet18": history_resnet18
+}
+
+metrics_dict = {}
+for model_name, hist in models_histories.items():
+    metrics_dict[model_name] = {
+        "Test Accuracy": hist.get("test_acc", None),
+        "Test Loss": hist.get("test_loss", None),
+        "F1-Score": hist.get("test_f1", None),
+        "Precision": hist.get("test_precision", None),
+        "Recall": hist.get("test_recall", None)
+    }
+
+import pandas as pd
+import matplotlib.pyplot as plt
+
+df_metrics = pd.DataFrame(metrics_dict).T
+display(df_metrics.round(4))
+
+df_metrics[["Test Accuracy", "F1-Score", "Precision", "Recall"]].plot(kind='bar', figsize=(12,6))
+plt.title("Model Comparison based on Saved History")
+plt.ylabel("Score")
+plt.xticks(rotation=45)
+plt.ylim(0, 1.05)
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+models_histories = {
+    "baseline_tinycnn": history_baseline_tinycnn,
+    "enhanced_tinycnn": history_enhanced_tinycnn,
+    "tinyvit": history_tinyvit,
+    "tuned_tinyvit": history_tuned_tinyvit,
+    "mixup_tinyvit": history_mixup_tinyvit,
+    "mixup_wd_tinyvit": history_mixup_wd_tinyvit,
+    "resnet18": history_resnet18
+}
+
+metrics_dict = {}
+for model_name, hist in models_histories.items():
+    metrics_dict[model_name] = {
+        "Test Accuracy": hist.get("test_acc", None),
+        "Test Loss": hist.get("test_loss", None),
+        "F1-Score": np.mean(hist.get("test_f1", [0])),
+        "Precision": np.mean(hist.get("test_precision", [0])),
+        "Recall": np.mean(hist.get("test_recall", [0]))
+    }
+
+import pandas as pd
+import matplotlib.pyplot as plt
+
+df_metrics = pd.DataFrame(metrics_dict).T
+display(df_metrics.round(4))  # Show the table
+
+plot_titles = {
+    "Test Accuracy": "Model Comparison - Test Accuracy",
+    "Test Loss": "Model Comparison - Test Loss",
+    "F1-Score": "Model Comparison - F1 Score",
+    "Precision": "Model Comparison - Precision",
+    "Recall": "Model Comparison - Recall"
+}
+
+for metric in plot_titles:
+    plt.figure(figsize=(10, 5))
+    df_metrics[metric].plot(kind='bar', color='skyblue')
+    plt.title(plot_titles[metric])
+    plt.ylabel(metric)
+    plt.xticks(rotation=45)
+    if metric != "Test Loss":
+        plt.ylim(0, 1.05)
+    plt.grid(True, axis='y', linestyle='--', alpha=0.7)
+    plt.tight_layout()
+    plt.show()
+
+metrics_to_plot = ["Test Accuracy", "F1-Score", "Precision", "Recall"]
+df_metrics[metrics_to_plot].plot(kind='bar', figsize=(12, 6))
+plt.title("Model Comparison on Key Evaluation Metrics")
+plt.ylabel("Score")
+plt.xticks(rotation=45)
+plt.ylim(0, 1.05)
+plt.grid(True)
+plt.tight_layout()
+plt.show()
