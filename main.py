@@ -25,7 +25,6 @@ val_ann_dir   = os.path.join(root_dir, 'val',   'labels')
 print(f"Train: {len(os.listdir(train_img_dir))} imgs, {len(os.listdir(train_ann_dir))} labels")
 print(f" Val:  {len(os.listdir(val_img_dir))} imgs, {len(os.listdir(val_ann_dir))} labels")
 
-
 def parse_yolo(ann_dir, img_dir):
     samples = []
     for fn in glob.glob(f"{ann_dir}/*.txt"):
@@ -43,6 +42,123 @@ def parse_yolo(ann_dir, img_dir):
 train_samples = parse_yolo(train_ann_dir, train_img_dir)
 val_samples   = parse_yolo(val_ann_dir,   val_img_dir)
 print("Crops:", len(train_samples), "train |", len(val_samples), "val")
+
+import matplotlib.pyplot as plt
+from collections import Counter
+import numpy as np
+
+# Class Distribution (Gun vs Knife)
+labels = [lab for *_, lab in train_samples]
+label_counts = Counter(labels)
+label_names = {0: "Gun", 1: "Knife"}
+
+plt.figure(figsize=(6, 4))
+plt.bar(label_names.values(), [label_counts.get(k, 0) for k in label_names])
+plt.title("Class Distribution in Weapons Training Dataset")
+plt.xlabel("Class")
+plt.ylabel("Number of Crops")
+plt.grid(True)
+plt.show()
+
+# Bounding Box Area Distribution
+areas = []
+for _, x1, y1, x2, y2, _ in train_samples:
+    area = (x2 - x1) * (y2 - y1)
+    if area > 0:
+        areas.append(area)
+
+plt.figure(figsize=(6, 4))
+plt.hist(areas, bins=50, color='orange')
+plt.title("Bounding Box Area Distribution")
+plt.xlabel("Area (pixels²)")
+plt.ylabel("Frequency")
+plt.grid(True)
+plt.show()
+
+# Aspect Ratio Distribution (Width / Height)
+aspect_ratios = []
+for _, x1, y1, x2, y2, _ in train_samples:
+    w = x2 - x1
+    h = y2 - y1
+    if w > 0 and h > 0:
+        aspect_ratios.append(w / h)
+
+plt.figure(figsize=(6, 4))
+plt.hist(aspect_ratios, bins=40, color='green')
+plt.title("Bounding Box Aspect Ratios")
+plt.xlabel("W / H")
+plt.ylabel("Frequency")
+plt.grid(True)
+plt.show()
+
+# Image Dimensions Distribution (W, H)
+img_dims = []
+for p, *_ in train_samples:
+    img = cv2.imread(p)
+    if img is not None:
+        h, w = img.shape[:2]
+        img_dims.append((w, h))
+
+widths, heights = zip(*img_dims)
+plt.figure(figsize=(6, 4))
+plt.hist(widths, bins=30, alpha=0.6, label='Width')
+plt.hist(heights, bins=30, alpha=0.6, label='Height')
+plt.title("Original Image Dimensions")
+plt.xlabel("Pixels")
+plt.ylabel("Frequency")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# Sample Grid of Weapon Crops (Gun and Knife)
+import torchvision.utils
+from torchvision import transforms
+import torch
+
+tfms = transforms.Compose([
+    transforms.ToPILImage(),
+    transforms.Resize((32, 32)),
+    transforms.ToTensor()
+])
+
+samples_by_class = {0: [], 1: []}
+for sample in train_samples:
+    p, x1, y1, x2, y2, lab = sample
+    if lab in samples_by_class and len(samples_by_class[lab]) < 8:
+        img = cv2.imread(p)
+        if img is not None:
+            crop = img[y1:y2, x1:x2]
+            if crop is not None and crop.size > 0:
+                crop_tf = tfms(crop)
+                samples_by_class[lab].append(crop_tf)
+
+fig, axs = plt.subplots(1, 2, figsize=(10, 4))
+for i, cls in enumerate([0, 1]):
+    if samples_by_class[cls]:
+        grid = torchvision.utils.make_grid(samples_by_class[cls], nrow=4)
+        axs[i].imshow(grid.permute(1, 2, 0))
+        axs[i].set_title(label_names[cls])
+        axs[i].axis('off')
+plt.suptitle("Sample Weapon Crops")
+plt.tight_layout()
+plt.show()
+
+
+import random
+import numpy as np
+import torch
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+
+set_seed(42)
 
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -75,7 +191,9 @@ val_ds   = WeaponCropDataset(val_samples,   tfms)
 train_loader = DataLoader(train_ds, batch_size=32, shuffle=True,  num_workers=2)
 val_loader   = DataLoader(val_ds,   batch_size=32, shuffle=False, num_workers=2)
 
-print("Batches →", len(train_loader), "train |", len(val_loader), "val")
+print("Batches -->", len(train_loader), "train |", len(val_loader), "val")
+print("Total training samples:", len(train_ds))
+print("Total validation samples:", len(val_ds))
 
 import torch.nn as nn
 
@@ -137,15 +255,36 @@ def eval_one_epoch(dl):
             total    += xb.size(0)
     return loss_sum/total, correct/total
 
+history_baseline_tinycnn = {
+    "train_loss": [],
+    "train_acc": [],
+    "val_loss": [],
+    "val_acc": []
+}
+
+best_val_acc = 0.0
+best_model_path = 'baseline_tinycnn.pt'
 
 num_epochs = 15
-for e in range(1, num_epochs+1):
+for e in range(1, num_epochs + 1):
     tl, ta = train_one_epoch(train_loader)
     vl, va = eval_one_epoch(val_loader)
+
+    # Save metrics to history
+    history_baseline_tinycnn["train_loss"].append(tl)
+    history_baseline_tinycnn["train_acc"].append(ta)
+    history_baseline_tinycnn["val_loss"].append(vl)
+    history_baseline_tinycnn["val_acc"].append(va)
+
+    # Check for best model
+    if va > best_val_acc:
+        best_val_acc = va
+        torch.save(model.state_dict(), best_model_path)
+        print(f"Saved best model at epoch {e} with Val Acc: {va:.4f}")
+
     print(f"Epoch {e} | Train Acc {ta:.4f}, Loss {tl:.4f} | Val Acc {va:.4f}, Loss {vl:.4f}")
 
-torch.save(model.state_dict(), 'baseline_simplecnn.pt')
-print("Saved baseline_simplecnn_weapons.pt")
+print(f"\nBest model saved to {best_model_path} with Val Acc: {best_val_acc:.4f}")
 
 import os
 
@@ -157,14 +296,24 @@ test_samples = parse_yolo(test_ann_dir, test_img_dir)
 test_ds     = WeaponCropDataset(test_samples, tfms)
 test_loader = DataLoader(test_ds, batch_size=32, shuffle=False, num_workers=2)
 
-print(f"Test samples: {len(test_ds)} → Test batches: {len(test_loader)}")
+print(f"Test samples: {len(test_ds)} --> Test batches: {len(test_loader)}")
 
+# Evaluate on Test Set & Compute Metrics
 import torch
-from sklearn.metrics import classification_report, confusion_matrix
-import matplotlib.pyplot as plt
-import seaborn as sns
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    precision_score,
+    recall_score,
+    f1_score,
+)
+model = TinyCNN().to(device)
+model.load_state_dict(torch.load("baseline_tinycnn.pt"))
+model.eval()
 
 test_loss, test_acc = eval_one_epoch(test_loader)
+history_baseline_tinycnn["test_loss"] = (test_loss)
+history_baseline_tinycnn["test_acc"] = (test_acc)
 print(f"Test Loss: {test_loss:.4f} | Test Acc: {test_acc:.4f}")
 
 model.eval()
@@ -179,62 +328,452 @@ with torch.no_grad():
 
 print("\nClassification Report:")
 print(classification_report(all_labels, all_preds, target_names=['gun','knife']))
-
-print("Confusion Matrix:")
 cm = confusion_matrix(all_labels, all_preds)
-print(cm)
+print("Confusion Matrix:")
+print(confusion_matrix(all_labels, all_preds))
 
-plt.figure(figsize=(6,5))
-sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=['gun','knife'], yticklabels=['gun','knife'])
-plt.xlabel('Predicted')
-plt.ylabel('True')
-plt.title('Confusion Matrix')
-plt.show()
+history_baseline_tinycnn["test_precision"] = precision_score(all_labels, all_preds, average='weighted', zero_division=0)
+history_baseline_tinycnn["test_recall"] = recall_score(all_labels, all_preds, average='weighted', zero_division=0)
+history_baseline_tinycnn["test_f1"] = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
+history_baseline_tinycnn["test_confusion_matrix"] = cm.tolist()
 
 import matplotlib.pyplot as plt
-import seaborn as sns
+
+train_loss = history_baseline_tinycnn["train_loss"]
+val_loss   = history_baseline_tinycnn["val_loss"]
+train_acc  = history_baseline_tinycnn["train_acc"]
+val_acc    = history_baseline_tinycnn["val_acc"]
+test_acc   = history_baseline_tinycnn.get("test_acc", None)
+
+epochs = range(1, len(train_loss) + 1)
+
+
+plt.figure(figsize=(10, 4))
+
+plt.subplot(1, 2, 1)
+plt.plot(epochs, train_loss, 'b-o', label='Train Loss')
+plt.plot(epochs, val_loss, 'r-o', label='Val Loss')
+plt.title("Loss per Epoch")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.legend()
+plt.grid(True)
+
+
+plt.subplot(1, 2, 2)
+plt.plot(epochs, train_acc, 'b-o', label='Train Acc')
+plt.plot(epochs, val_acc, 'r-o', label='Val Acc')
+if test_acc is not None:
+    plt.axhline(test_acc, color='g', linestyle='--', label=f'Test Acc = {test_acc:.2f}')
+plt.title("Accuracy per Epoch")
+plt.xlabel("Epoch")
+plt.ylabel("Accuracy")
+plt.legend()
+plt.grid(True)
+
+plt.tight_layout()
+plt.show()
+
+!curl -L -o /content/human-parts-dataset.zip\
+  https://www.kaggle.com/api/v1/datasets/download/motsimaslam/human-parts-dataset
+
+import zipfile
+import os
+import matplotlib.pyplot as plt
+import cv2
+
+human_parts_zip_path = '/content/human-parts-dataset.zip'
+human_parts_extract_dir = '/content/data/human_parts_dataset'
+
+# Unzip the human parts dataset
+if not os.path.isdir(human_parts_extract_dir):
+    with zipfile.ZipFile(human_parts_zip_path, 'r') as zf:
+        zf.extractall(human_parts_extract_dir)
+    print("Human parts dataset unzipped to:", human_parts_extract_dir)
+else:
+    print("Human parts dataset already unzipped at:", human_parts_extract_dir)
+
+print("\nContents of the human parts dataset:")
+for root, dirs, files in os.walk(human_parts_extract_dir):
+    level = root.replace(human_parts_extract_dir, '').count(os.sep)
+    indent = ' ' * 4 * (level)
+    print(f'{indent}{os.path.basename(root)}/')
+    subindent = ' ' * 4 * (level + 1)
+    for f in files[:5]:
+        print(f'{subindent}{f}')
+    if len(files) > 5:
+        print(f'{subindent}...')
+
+print("\nVisualizing samples...")
+
+image_paths = []
+labels = []
+
+for subdir, _, files in os.walk(human_parts_extract_dir):
+    img_files = [f for f in files if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+    if img_files:
+        sample_path = os.path.join(subdir, img_files[0])
+        image_paths.append(sample_path)
+        labels.append(os.path.basename(subdir))
+
+n = len(image_paths)
+cols = min(n, 5)
+rows = (n + cols - 1) // cols
+
+plt.figure(figsize=(15, 3 * rows))
+for i, img_path in enumerate(image_paths):
+    img = cv2.imread(img_path)
+    if img is not None:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        plt.subplot(rows, cols, i + 1)
+        plt.imshow(img)
+        plt.title(labels[i])
+        plt.axis('off')
+
+plt.tight_layout()
+plt.suptitle("Sample Human Body Part Images", fontsize=16)
+plt.show()
+
+import json
+import os
+
+train_ann_sample_path = os.path.join(human_parts_extract_dir, 'train', 'ann', '456f2dc91bef78bd76b7af24e0f65314e2283a19.jpeg.json')
+val_ann_sample_path   = os.path.join(human_parts_extract_dir, 'val',   'ann', 'e52d1397dfb1a29e77cf14b5af05f23354fa949b.jpeg.json')
+
+def print_json_content(filepath, description):
+    print(f"\n--- Content of {description} ({os.path.basename(filepath)}) ---")
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, 'r') as f:
+                data = json.load(f)
+                print(json.dumps(data, indent=2)[:1000] + "..." if len(json.dumps(data)) > 1000 else json.dumps(data, indent=2))
+        except json.JSONDecodeError:
+            print(f"Error decoding JSON from {filepath}")
+        except Exception as e:
+            print(f"An error occurred while reading {filepath}: {e}")
+    else:
+        print(f"File not found: {filepath}")
+
+
+print_json_content(train_ann_sample_path, "Train annotation sample")
+print_json_content(val_ann_sample_path, "Validation annotation sample")
+
+human_parts_root_dir = human_parts_extract_dir
+hp_train_img_dir     = os.path.join(human_parts_root_dir, 'train', 'img')
+hp_train_ann_dir     = os.path.join(human_parts_root_dir, 'train', 'ann')
+hp_val_img_dir       = os.path.join(human_parts_root_dir, 'val',   'img')
+hp_val_ann_dir       = os.path.join(human_parts_root_dir, 'val',   'ann')
+
+def parse_human_parts(ann_dir, img_dir):
+    samples = []
+    for fn in glob.glob(f"{ann_dir}/*.json"):
+        base_fn = os.path.basename(fn)
+        if base_fn.endswith('.json'):
+            base_fn = base_fn[:-5]
+
+        if base_fn.endswith('.jpeg'):
+            base_fn = base_fn[:-5]
+
+        img_fn = base_fn + '.jpeg'
+        img_p  = os.path.join(img_dir, img_fn)
+
+        if not os.path.isfile(img_p):
+            print(f"Warning: Image file not found for annotation: {img_p}")
+            continue
+
+        try:
+            with open(fn, 'r') as f:
+                data = json.load(f)
+        except json.JSONDecodeError:
+            print(f"Error decoding JSON from {fn}. Skipping.")
+            continue
+        except Exception as e:
+            print(f"An error occurred reading {fn}: {e}. Skipping.")
+            continue
+
+
+        if 'objects' in data and isinstance(data['objects'], list):
+            for obj in data['objects']:
+                if (obj.get('geometryType') == 'rectangle' and
+                    'points' in obj and 'exterior' in obj['points'] and
+                    isinstance(obj['points']['exterior'], list) and
+                    len(obj['points']['exterior']) == 2):
+
+                    x1, y1 = obj['points']['exterior'][0]
+                    x2, y2 = obj['points']['exterior'][1]
+                    class_title = obj.get('classTitle', 'unknown')
+                    x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                    x1, x2 = min(x1, x2), max(x1, x2)
+                    y1, y2 = min(y1, y2), max(y1, y2)
+
+                    samples.append((img_p, x1, y1, x2, y2, class_title))
+
+    return samples
+
+hp_train_samples = parse_human_parts(hp_train_ann_dir, hp_train_img_dir)
+hp_val_samples   = parse_human_parts(hp_val_ann_dir, hp_val_img_dir)
+
+print(f"Parsed Human Parts Crops: {len(hp_train_samples)} train | {len(hp_val_samples)} val")
+
+human_parts_root_dir = human_parts_extract_dir
+
+hp_train_img_dir     = os.path.join(human_parts_root_dir, 'train', 'img')
+hp_train_ann_dir     = os.path.join(human_parts_root_dir, 'train', 'ann')
+hp_val_img_dir       = os.path.join(human_parts_root_dir, 'val',   'img')
+hp_val_ann_dir       = os.path.join(human_parts_root_dir, 'val',   'ann')
+
+hp_train_samples = parse_human_parts(hp_train_ann_dir, hp_train_img_dir)
+hp_val_samples   = parse_human_parts(hp_val_ann_dir, hp_val_img_dir)
+
+# Print the number of samples found
+print(f"Parsed Human Parts Crops: {len(hp_train_samples)} train | {len(hp_val_samples)} val")
+
+import os
+import json
+import glob
+import cv2
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import random
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from sklearn.metrics import classification_report, confusion_matrix, precision_recall_fscore_support
+import matplotlib.pyplot as plt
 from collections import Counter
 
-all_samples = train_samples + val_samples + test_samples
-classes = [sample[-1] for sample in all_samples]
+# seed for reproducibility
+torch.manual_seed(42)
+np.random.seed(42)
+random.seed(42)
 
-class_counts = Counter(classes)
-class_names = {0: 'gun', 1: 'knife'}
+class EnhancedWeaponCropDataset(Dataset):
 
-print("Class Distribution:")
-for cls, count in class_counts.items():
-    print(f"{class_names[cls]}: {count}")
+    def __init__(self, weapon_samples, human_parts_samples=None, transform=None,
+                 balance_classes=True, max_human_parts=None):
+        self.samples = []
+        self.transform = transform
 
-plt.figure(figsize=(6, 4))
-sns.barplot(x=list(class_names.values()), y=list(class_counts.values()))
-plt.title('Distribution of Classes')
-plt.xlabel('Class')
-plt.ylabel('Number of Samples')
-plt.show()
+        for sample in weapon_samples:
+            self.samples.append(sample)
 
-import cv2
-import matplotlib.pyplot as plt
-import seaborn as sns
+        # Add human parts samples as class 2 (negative samples)
+        if human_parts_samples:
+            human_parts_list = list(human_parts_samples)
 
-def display_samples(samples, num_samples=5):
-    plt.figure(figsize=(15, 5))
-    for i in range(min(num_samples, len(samples))):
-        p, x1, y1, x2, y2, lab = samples[i]
-        img  = cv2.imread(p)
-        img  = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        crop = img[y1:y2, x1:x2]
+            if max_human_parts and len(human_parts_list) > max_human_parts:
+                human_parts_list = random.sample(human_parts_list, max_human_parts)
 
-        plt.subplot(1, num_samples, i + 1)
-        plt.imshow(crop)
-        plt.title(f"Class: {class_names[lab]}")
-        plt.axis('off')
-    plt.tight_layout()
-    plt.show()
+            for img_path, x1, y1, x2, y2, class_title in human_parts_list:
+                self.samples.append((img_path, x1, y1, x2, y2, 2))
 
-print("\nSample 'gun' images:")
-gun_samples = [s for s in all_samples if s[-1] == 0]
-display_samples(gun_samples)
+        if balance_classes:
+            self._balance_classes()
 
-print("\nSample 'knife' images:")
-knife_samples = [s for s in all_samples if s[-1] == 1]
-display_samples(knife_samples)
+        print(f"Dataset created with {len(self.samples)} samples")
+        self._print_class_distribution()
+
+    def _balance_classes(self):
+        class_samples = {0: [], 1: [], 2: []}
+        for sample in self.samples:
+            class_id = sample[5]
+            if class_id in class_samples:
+                class_samples[class_id].append(sample)
+
+        min_size = min(len(samples) for samples in class_samples.values() if len(samples) > 0)
+
+        balanced_samples = []
+        for class_id, samples in class_samples.items():
+            if len(samples) > 0:
+                if len(samples) > min_size:
+                    samples = random.sample(samples, min_size)
+                balanced_samples.extend(samples)
+
+        self.samples = balanced_samples
+        print(f"Balanced dataset to {len(self.samples)} samples")
+
+    def _print_class_distribution(self):
+        class_counts = Counter(sample[5] for sample in self.samples)
+        print("Class distribution:")
+        class_names = {0: 'gun', 1: 'knife', 2: 'human_part'}
+        for class_id, count in sorted(class_counts.items()):
+            print(f"  {class_names.get(class_id, f'class_{class_id}')}: {count}")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        img_path, x1, y1, x2, y2, class_id = self.samples[idx]
+
+        img = cv2.imread(img_path)
+        if img is None:
+            print(f"Warning: Could not read image {img_path}")
+            return torch.zeros(3, 32, 32), 0
+
+        h, w = img.shape[:2]
+        x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
+
+        if x2 > x1 and y2 > y1:
+            crop = img[y1:y2, x1:x2]
+        else:
+            return torch.zeros(3, 32, 32), 0
+
+        # Apply transformations
+        if self.transform:
+            crop = self.transform(crop)
+
+        return crop, class_id
+
+def create_enhanced_datasets_for_existing_code(train_samples, val_samples, test_samples,
+                                               hp_train_samples, hp_val_samples):
+    train_transforms, val_transforms = create_enhanced_transforms()
+
+    # Create enhanced datasets
+    train_ds = EnhancedWeaponCropDataset(
+        weapon_samples=train_samples,
+        human_parts_samples=hp_train_samples,
+        transform=train_transforms,
+        balance_classes=True,
+        max_human_parts=8000  # Adjust based on your memory constraints
+    )
+
+    val_ds = EnhancedWeaponCropDataset(
+        weapon_samples=val_samples,
+        human_parts_samples=hp_val_samples,
+        transform=val_transforms,
+        balance_classes=True,
+        max_human_parts=2000
+    )
+
+    test_ds = EnhancedWeaponCropDataset(
+        weapon_samples=test_samples,
+        human_parts_samples=None,  # No human parts in test set
+        transform=val_transforms,
+        balance_classes=False
+    )
+
+    return train_ds, val_ds, test_ds
+
+class ImprovedTinyCNN(nn.Module):
+
+    def __init__(self, num_classes=3):
+        super().__init__()
+
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 16, kernel_size=3, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(64 * 4 * 4, 128),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(64, num_classes)
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.classifier(x)
+        return x
+
+def create_enhanced_transforms():
+    train_transforms = transforms.Compose([
+        transforms.ToPILImage(),
+        transforms.Resize((32, 32)),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomRotation(degrees=15),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    val_transforms = transforms.Compose([
+        transforms.ToPILImage(),
+        transforms.Resize((32, 32)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    return train_transforms, val_transforms
+
+def train_one_epoch_enhanced(model, dataloader, criterion, optimizer, device):
+    model.train()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+
+    for batch_idx, (data, target) in enumerate(dataloader):
+        data, target = data.to(device), target.to(device)
+
+        optimizer.zero_grad()
+        output = model(data)
+        loss = criterion(output, target)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item()
+        pred = output.argmax(dim=1)
+        correct += pred.eq(target).sum().item()
+        total += target.size(0)
+
+    avg_loss = running_loss / len(dataloader)
+    accuracy = correct / total
+
+    return avg_loss, accuracy
+
+def validate_enhanced(model, dataloader, criterion, device):
+    model.eval()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+    all_preds = []
+    all_targets = []
+
+    with torch.no_grad():
+        for data, target in dataloader:
+            data, target = data.to(device), target.to(device)
+            output = model(data)
+            loss = criterion(output, target)
+
+            running_loss += loss.item()
+            pred = output.argmax(dim=1)
+            correct += pred.eq(target).sum().item()
+            total += target.size(0)
+
+            all_preds.extend(pred.cpu().numpy())
+            all_targets.extend(target.cpu().numpy())
+
+    avg_loss = running_loss / len(dataloader)
+    accuracy = correct / total
+
+    return avg_loss, accuracy, all_preds, all_targets
+
+num_epochs = 20
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+model = ImprovedTinyCNN(num_classes=3).to(device)
+print("Model architecture:")
+print(model)
+
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
+scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
